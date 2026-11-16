@@ -573,8 +573,11 @@ def cmd_run(args, p):
         fail_closed(p, rec, rec["reasons"])
     try:
         os.makedirs(p.state, exist_ok=True)
-        write_atomic(p.report, json.dumps(rec, indent=1) + "\n")
-        write_atomic(p.bind, "".join(f"{k}={rec[k]}\n" for k in ["result", *BIND_KEYS]))
+        # Root only: the records name this Mac's unit (a hash of its serial) and its tuning's
+        # provenance. Only root reads them (the gate, provisioning, the self-check's generate);
+        # a session reads speakerguardd.conf, graph_state and selfcheck.json instead.
+        write_atomic(p.report, json.dumps(rec, indent=1) + "\n", mode=0o600)
+        write_atomic(p.bind, "".join(f"{k}={rec[k]}\n" for k in ["result", *BIND_KEYS]), mode=0o600)
     except OSError as e:
         log(f"writing the record: {e}")
         return 1
