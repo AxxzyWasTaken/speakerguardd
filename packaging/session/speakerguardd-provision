@@ -1049,8 +1049,23 @@ def cmd_graph_user(args, p):
             os.symlink(target, path)
             log(f"linked {path}")
     if not seat:
-        log(f"uid {os.getuid()} is not the seat user ({conf.get('SGV2_USER', 'none provisioned')}): no speaker graph here")
+        log(f"{not_seat_reason(conf, st)}: no speaker graph here")
     return 0
+
+
+def not_seat_reason(conf, st):
+    """Why this session gets no v2 speaker graph: not the seat user, or the
+    seat user in a boot where v2 is not provisioned (no graph, or the self-check
+    has not passed)."""
+    uid = str(os.getuid())
+    if not conf.get("SGV2_UID"):
+        return "speakerguardd v2 is not provisioned (no seat user)"
+    if conf.get("SGV2_UID") != uid:
+        return f"uid {uid} is not the seat user ({conf.get('SGV2_USER', 'none provisioned')})"
+    result = st.get("result")
+    if result is None:
+        return f"uid {uid} is the seat user, but speakerguardd v2 is not provisioned in this boot"
+    return f"uid {uid} is the seat user, but speakerguardd v2's graph is not ready in this boot (result={result})"
 
 
 def cmd_is_seat(args, p):
@@ -1059,7 +1074,7 @@ def cmd_is_seat(args, p):
     without v2 there is none, and the configuration in /etc is stale)."""
     conf = read_kv(p.conf)
     if conf.get("SGV2_UID") != str(os.getuid()):
-        log(f"uid {os.getuid()} is not the seat user ({conf.get('SGV2_USER', 'none provisioned')}): not starting")
+        log(f"{not_seat_reason(conf, {})}: not starting")
         return 1
     if read_kv(p.graph_state).get("result") != "pass":
         log("speakerguardd v2 is not provisioned in this boot (no speaker graph): not starting")
