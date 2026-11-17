@@ -37,6 +37,13 @@
 //! which `run` applies to the program before the unit sees it) is unstable
 //! or would add drive.
 //!
+//! Sense binding: an lsm2 unit with an LSID companion feeds its estimator
+//! only from a source the host has bound. The supervisor offers the binding
+//! on the engine page once it has proven this blob's sense wiring (see
+//! [`page::EnginePage::sense_bind`]); `run` binds while that word is fresh
+//! and names this blob, drops it otherwise, and reports what it did. The
+//! companion's release gates are not touched: a gated unit stays muted.
+//!
 //! `activate` clears the audio histories but not the thermal model: `run`
 //! publishes the unit's thermal state after every call and `activate`
 //! restores the latest record that fits, cooled for the time since (see
@@ -130,6 +137,54 @@ impl AnyUnit {
             AnyUnit::Spp3(u) => u.sense_delay(),
             _ => None,
         }
+    }
+    /// Follow the supervisor's sense binding: with `bind`, bind the sense
+    /// input to the source the unit's LSID companion names (the plugin's
+    /// sense ports are that input once the supervisor has proven the
+    /// wiring); without, drop any binding. Returns the [`page`] `SENSE_*`
+    /// state. Only an lsm2 unit with an LSID companion binds; every other
+    /// unit runs as before. No allocation: real time safe.
+    pub fn follow_sense_bind(&mut self, bind: bool) -> u32 {
+        let AnyUnit::Lsm2(u) = self else {
+            return if bind { page::SENSE_NO_COMPANION } else { page::SENSE_UNBOUND };
+        };
+        if !bind {
+            u.unbind_sense_source();
+            return page::SENSE_UNBOUND;
+        }
+        if u.sense_source_bound() {
+            return page::SENSE_BOUND;
+        }
+        let Some(companion) = u.companion() else {
+            return page::SENSE_NO_COMPANION;
+        };
+        let id = companion.topology.map_or([0u8; 64], |t| t.source);
+        let end = id.iter().position(|&b| b == 0).unwrap_or(id.len());
+        let source = core::str::from_utf8(&id[..end]).unwrap_or("");
+        match u.bind_sense_source(source) {
+            Ok(()) => page::SENSE_BOUND,
+            Err(_) => page::SENSE_REFUSED,
+        }
+    }
+}
+
+impl AnyUnit {
+    /// Follow the supervisor's drive request ([`page::EnginePage::drive_cap`]):
+    /// the unit models the amps at `level` 0.5 dB steps below the blob's
+    /// operating point (the kernel's gain cap), or at the operating point
+    /// itself without a fresh request. Returns what it models, for the ack:
+    /// the request's sequence and its level, or level 0 when the unit
+    /// cannot scale its model (it then models the most drive). Real time
+    /// safe.
+    pub fn follow_drive_cap(&mut self, req: Option<(u32, i32)>) -> (u32, i32) {
+        let (seq, level) = req.unwrap_or((0, 0));
+        let applied = match self {
+            AnyUnit::Spp3(u) => u.set_drive_scale(page::drive_scale(level)),
+            // lsm2 and atsp keep the blob's own operating point (the most
+            // drive); the fail-safe and the placeholder model nothing
+            _ => false,
+        };
+        (seq, if applied { level } else { 0 })
     }
 }
 
@@ -243,6 +298,14 @@ struct Instance {
     ramp: gate::Ramp,
     /// The first frames of a wake, held until the amps play.
     preroll: Box<preroll::PreRoll>,
+    /// The supervisor's sense binding as last followed (`None`: not yet),
+    /// and the `SENSE_*` state that gave.
+    sense_bind: Option<bool>,
+    sense_state: u32,
+    /// The supervisor's drive request as last followed (`None`: not yet),
+    /// and what the unit models since: `(seq, level)` for the ack.
+    drive_req: Option<Option<(u32, i32)>>,
+    drive_ack: (u32, i32),
 }
 
 fn env_or(var: &str, default: String) -> String {
@@ -301,6 +364,10 @@ unsafe extern "C" fn instantiate(
         gate: gate::Gate::watch(),
         ramp: gate::Ramp::new(rate),
         preroll: Box::new(preroll::PreRoll::new(channels, rate)),
+        sense_bind: None,
+        sense_state: page::SENSE_UNBOUND,
+        drive_req: None,
+        drive_ack: (0, 0),
     });
     Box::into_raw(instance).cast()
 }
@@ -474,6 +541,27 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
     }
     // An incomplete sense bus is no bus: the unit runs open loop.
     let sense_slice = if sense_n == s { &sense[..s] } else { &sense[..0] };
+    // The sense binding holds only while the attached page carries the
+    // supervisor's fresh word for exactly this blob: a re-attached page, a
+    // stopped supervisor or a broken proof drops it within the stale bound.
+    let bind = s > 0 && page.is_some_and(|p| p.sense_bind(instance.params_crc));
+    if instance.sense_bind != Some(bind) {
+        instance.sense_bind = Some(bind);
+        instance.sense_state = instance.unit.follow_sense_bind(bind);
+    }
+    // The kernel's gain cap, as the supervisor asks the unit to model it:
+    // applied before this call's audio, then acknowledged (the ack never
+    // names a level the unit does not model yet). Without a
+    // fresh request the unit models the blob's own operating point, the
+    // most drive the amps can take.
+    let req = page.and_then(|p| p.drive_cap());
+    if instance.drive_req != Some(req) {
+        instance.drive_req = Some(req);
+        instance.drive_ack = instance.unit.follow_drive_cap(req);
+    }
+    if let Some(p) = page {
+        p.report_drive_cap(instance.drive_ack.0, instance.drive_ack.1);
+    }
     let unit = instance.unit.as_dyn();
     let latency = unit.latency_frames() as f32;
     let health = unit.process(Io { frames, input: &filtered[..n], sense: sense_slice, output: &mut out_store[..n] });
@@ -508,6 +596,7 @@ fn run_chunk(instance: &mut Instance, page: Option<&page::EnginePage>, off: usiz
         }
         let w = &instance.preroll;
         page.publish_wakes(w.wakes, w.last_wake, w.overflow);
+        page.report_sense_bound(instance.sense_state);
         page.beat(instance.frames, health, delay);
     }
     for (port, value) in [(2 * n + s, latency), (2 * n + s + 1, health.0 as f32), (2 * n + s + 2, delay as f32)] {
@@ -598,8 +687,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -755,8 +844,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -839,8 +928,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,
@@ -980,8 +1069,8 @@ mod tests {
             thermal_protection_enabled: 1,
             ..Default::default()
         };
-        for c in 0..2 {
-            p.ch[c] = spp3::ChannelParams {
+        for (c, ch) in p.ch[..2].iter_mut().enumerate() {
+            *ch = spp3::ChannelParams {
                 source: c as u32,
                 t_sett_vc: 20.0,
                 t_sett_mg: 10.0,

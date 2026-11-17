@@ -238,12 +238,17 @@ class Provision(Base):
         for path in (self.p.bind, self.p.report, self.p.conf):
             with open(path, "rb") as f:
                 self.assertNotIn(b"SYNTHETIC0A", f.read())
+        # The unit ID is root-only at rest, on a pass and on a failure alike.
+        for path in (self.p.bind, self.p.report):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
         # Another Mac's extraction and a missing/malformed local identity
         # must never reuse a blob or compile in open-loop fallback mode.
         with open(os.path.join(self.dt, "serial-number"), "wb") as f:
             f.write(b"SYNTHETIC0B\0")
         self.assertEqual(self.run_(), 1)
         self.assert_closed("provenance")
+        for path in (self.p.bind, self.p.report):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
         os.unlink(os.path.join(self.dt, "serial-number"))
         self.assertEqual(self.run_(), 1)
         self.assert_closed("provenance")
@@ -511,6 +516,38 @@ class Graph(Base):
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
         self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
         self.assertEqual(os.listdir(os.path.join(home, "pipewire", "pipewire.conf.d")), [])
+
+    def test_the_seat_user_without_v2_this_boot_is_told_so(self):
+        """A boot without v2 (no /run graph) or before the self-check passed:
+        the seat user's session is told v2 is not provisioned in this boot,
+        never that it is not the seat user."""
+        self.provisioned()
+
+        def said(cmd):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                getattr(prov, cmd)(self.args("graph-user"), self.p)
+            return err.getvalue()
+
+        shutil.rmtree(self.p.graph)
+        out = said("cmd_graph_user")
+        self.assertNotIn("is not the seat user", out)
+        self.assertIn(f"uid {ME.pw_uid} is the seat user, but speakerguardd v2 is not provisioned in this boot", out)
+        os.makedirs(self.p.graph)
+        prov.write_atomic(self.p.graph_state, "result=pending\n")
+        out = said("cmd_graph_user")
+        self.assertNotIn("is not the seat user", out)
+        self.assertIn("graph is not ready in this boot (result=pending)", out)
+        out = said("cmd_is_seat")
+        self.assertIn("not provisioned in this boot", out)
+        # another user: told it is not the seat user, by name
+        conf = open(self.p.conf).read().replace(f"SGV2_UID={ME.pw_uid}", f"SGV2_UID={ME.pw_uid + 1}")
+        prov.write_atomic(self.p.conf, conf)
+        for cmd in ("cmd_graph_user", "cmd_is_seat"):
+            self.assertIn(f"uid {ME.pw_uid} is not the seat user ({ME.pw_name})", said(cmd))
+        # nothing provisioned at all
+        prov.write_atomic(self.p.conf, "# empty\n")
+        self.assertIn("speakerguardd v2 is not provisioned (no seat user)", said("cmd_graph_user"))
 
     def test_a_foreign_file_is_left_alone(self):
         home = self.provisioned()
@@ -1017,6 +1054,17 @@ class Umask(Base):
             self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755, d)
 
 
+    def test_an_unreadable_config_dir_is_repaired(self):
+        """J815: /etc/speakerguardd left 0700 by aurora-speaker-upgrade's
+        umask 077; systemd only warns about it. The seat user's session read
+        no speakerguardd.conf ("none provisioned") and linked no graph."""
+        import stat
+        os.makedirs(self.p.etc, exist_ok=True)
+        os.chmod(self.p.etc, 0o700)
+        self.assertEqual(self.run_(force=True), 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.p.etc).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.p.conf).st_mode), 0o644)
+
     def test_the_blob_from_the_macs_own_tuning_stays_root_only(self):
         """The graph directories open up for the session; the compiled blob
         at rest does not, under the units' umask or the upgrade tool's."""
@@ -1369,6 +1417,75 @@ class Gate(Base):
 
 
 JACK = b"apple,j616-macaudio-jack\0apple,macaudio\0"
+
+
+class SpeakerRouting(Base):
+    def setUp(self):
+        super().setUp()
+        self.route = "Primary"
+        self.writes = []
+        self.reads = 0
+        self.write_error = False
+        self.ignore_write = False
+        run = prov.subprocess.run
+
+        def amixer(argv, **kw):
+            if argv[0] != "amixer":
+                return run(argv, **kw)
+            self.assertEqual(argv[:3], ["amixer", "-c", "AppleJ316"])
+            self.assertEqual(argv[4], "name=Speaker Playback Mux")
+            if argv[3] == "cset":
+                self.assertEqual(argv[5:], ["Secondary"])
+                self.writes.append(argv[5])
+                if self.write_error:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="Device or resource busy")
+                if not self.ignore_write:
+                    self.route = "Secondary"
+            else:
+                self.assertEqual(argv[3], "cget")
+                self.reads += 1
+            value = 1 if self.route == "Secondary" else 0
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=(
+                "; type=ENUMERATED,access=rw------,values=1,items=2\n"
+                "; Item #0 'Primary'\n; Item #1 'Secondary'\n"
+                f": values={value}\n"))
+
+        self.patch(prov.subprocess, "run", amixer)
+
+    def live(self):
+        # Keep every path under the test root; exercise the hardware branch
+        # with only the mixer boundary replaced.
+        self.p.root = ""
+        return self.run_()
+
+    def test_fresh_card_routes_pcm1_before_the_graph_can_start(self):
+        self.assertEqual(self.live(), 0)
+        self.assertEqual(self.route, "Secondary")
+        self.assertEqual(self.writes, ["Secondary"])
+        self.assertEqual(self.reads, 2)
+
+    def test_existing_secondary_route_is_read_without_a_write(self):
+        self.route = "Secondary"
+        self.assertEqual(self.live(), 0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reads, 1)
+
+    def test_busy_route_fails_closed(self):
+        self.write_error = True
+        self.assertEqual(self.live(), 1)
+        self.assertFalse(os.path.exists(self.p.conf))
+        self.assertFalse(os.path.exists(self.p.params))
+        self.assertEqual(self.record()["result"], "fail")
+
+    def test_unchanged_readback_fails_closed(self):
+        self.ignore_write = True
+        self.assertEqual(self.live(), 1)
+        self.assertFalse(os.path.exists(self.p.conf))
+        self.assertFalse(os.path.exists(self.p.params))
+
+    def test_test_root_never_touches_the_live_mixer(self):
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual((self.reads, self.writes), (0, []))
 
 
 class SpeakerCard(unittest.TestCase):
