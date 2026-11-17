@@ -238,12 +238,17 @@ class Provision(Base):
         for path in (self.p.bind, self.p.report, self.p.conf):
             with open(path, "rb") as f:
                 self.assertNotIn(b"SYNTHETIC0A", f.read())
+        # The unit ID is root-only at rest, on a pass and on a failure alike.
+        for path in (self.p.bind, self.p.report):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
         # Another Mac's extraction and a missing/malformed local identity
         # must never reuse a blob or compile in open-loop fallback mode.
         with open(os.path.join(self.dt, "serial-number"), "wb") as f:
             f.write(b"SYNTHETIC0B\0")
         self.assertEqual(self.run_(), 1)
         self.assert_closed("provenance")
+        for path in (self.p.bind, self.p.report):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
         os.unlink(os.path.join(self.dt, "serial-number"))
         self.assertEqual(self.run_(), 1)
         self.assert_closed("provenance")
