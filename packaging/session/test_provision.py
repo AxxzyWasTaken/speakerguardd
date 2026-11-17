@@ -517,6 +517,38 @@ class Graph(Base):
         self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
         self.assertEqual(os.listdir(os.path.join(home, "pipewire", "pipewire.conf.d")), [])
 
+    def test_the_seat_user_without_v2_this_boot_is_told_so(self):
+        """A boot without v2 (no /run graph) or before the self-check passed:
+        the seat user's session is told v2 is not provisioned in this boot,
+        never that it is not the seat user."""
+        self.provisioned()
+
+        def said(cmd):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                getattr(prov, cmd)(self.args("graph-user"), self.p)
+            return err.getvalue()
+
+        shutil.rmtree(self.p.graph)
+        out = said("cmd_graph_user")
+        self.assertNotIn("is not the seat user", out)
+        self.assertIn(f"uid {ME.pw_uid} is the seat user, but speakerguardd v2 is not provisioned in this boot", out)
+        os.makedirs(self.p.graph)
+        prov.write_atomic(self.p.graph_state, "result=pending\n")
+        out = said("cmd_graph_user")
+        self.assertNotIn("is not the seat user", out)
+        self.assertIn("graph is not ready in this boot (result=pending)", out)
+        out = said("cmd_is_seat")
+        self.assertIn("not provisioned in this boot", out)
+        # another user: told it is not the seat user, by name
+        conf = open(self.p.conf).read().replace(f"SGV2_UID={ME.pw_uid}", f"SGV2_UID={ME.pw_uid + 1}")
+        prov.write_atomic(self.p.conf, conf)
+        for cmd in ("cmd_graph_user", "cmd_is_seat"):
+            self.assertIn(f"uid {ME.pw_uid} is not the seat user ({ME.pw_name})", said(cmd))
+        # nothing provisioned at all
+        prov.write_atomic(self.p.conf, "# empty\n")
+        self.assertIn("speakerguardd v2 is not provisioned (no seat user)", said("cmd_graph_user"))
+
     def test_a_foreign_file_is_left_alone(self):
         home = self.provisioned()
         d = os.path.join(home, "pipewire", "pipewire.conf.d")
